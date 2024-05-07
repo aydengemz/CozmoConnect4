@@ -1,0 +1,512 @@
+from cozmo_fsm import *
+from cozmo.world import *
+from cozmo.objects import *
+import os
+import re
+import openai
+
+prompt = """
+Here are some examples of moves to play:
+
+
+Early Game:
+
+Board:
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | X | . | . | . |
+
+| 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+Player Turn: O
+
+Optimal Move: Column 4.
+
+Reasoning:
+
+Placing O in column 4 directly above X counters X’s advantage in the center column. Controlling the central column is crucial in Connect 4 for maximizing the number of potential connections.
+
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | X | O | . | . |
+
+| 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+Player Turn: X
+
+Optimal Move: Column 6.
+
+Reasoning:
+
+Placing X in column 6 expands the play to the right, offering X the chance to start forming a potentially winning line on the less contested right side. It provides a strategic advantage by opening multiple avenues for connection and forces O to play defensively rather than focusing on their own connections.
+
+
+These examples ensure that the AI makes decisions that are tactically sound and potentially winning, thus teaching the AI to play optimally and maintain strong positions throughout the game.
+
+
+Midgame:
+
+Board State:
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | X | . | . | . |
+
+| . | O | O | X | . | . | . |
+
+| X | X | O | O | X | . | . |
+
+| 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+Player Turn: X
+
+Optimal Move: Column 5.
+
+Reasoning:
+
+Placing X in column 5 creates multiple threats. It sets up a potential vertical win and also threatens to win diagonally. This move forces O to respond defensively, blocking X's potential win, which could divert O from progressing their own strategy.
+
+
+
+Board State:
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | X | . | . | . |
+
+| . | . | O | O | X | . | . |
+
+| . | X | X | O | O | . | . |
+
+| O | O | X | X | X | O | . |
+
+| 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+Player Turn: O
+
+Optimal Move: Column 2
+
+Reasoning:
+
+Placing O in column 2 not only blocks X from achieving a vertical line of four but also progresses O's vertical stack, creating a dual threat. This positions O strongly both offensively and defensively, as it maintains central control and complicates X's potential to create multiple threats.
+
+
+Winning Moves:
+
+Board:
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | X | . | . | . |
+
+| . | . | O | X | X | . | . |
+
+| . | O | O | X | O | X | . |
+
+| X | X | O | O | O | X | O |
+
+| 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+Player Turn: X
+
+Optimal Move: Column 4.
+
+Reasoning:
+
+Placing X in column 4 on top of the existing X forms a vertical line of four X's, achieving a winning combination. This move capitalizes on the central column dominance to clinch the victory.
+
+
+
+Board:
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | . | . | . | . |
+
+| . | . | . | X | X | . | . |
+
+| . | . | X | O | O | . | . |
+
+| . | X | O | X | O | O | O |
+
+| 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+
+Player Turn: X
+
+Optimal Move: Column 5
+
+Reasoning:
+
+Placing X in column 5 creates a four in a row diagonal in the board which allows X to win the game.
+
+"""
+
+query_array = [[".", ".", ".", ".", ".", ".", "."],
+                [".", ".", ".", ".", ".", ".", "."],
+                [".", ".", ".", ".", ".", ".", "."],
+                [".", ".", ".", ".", ".", ".", "."],
+                [".", ".", ".", ".", ".", ".", "."],
+                [".", ".", ".", ".", ".", ".", "."],
+                ["1", "2", "3", "4", "5", "6", "7"]]
+
+col = 4
+row = 1
+
+distance = 100
+distance2 = 100
+
+# | . | . | . | . | . | . | . |
+# | . | . | . | . | . | . | . |
+# | . | . | . | . | . | . | . |
+# | . | . | . | . | . | . | . |
+# | . | . | . | . | . | . | . |
+# | . | . | . | . | . | . | . |
+# | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+# Follow these rules:
+# 1. If there is a winning move, take it.
+# 2. If your opponent has a winning move, take the move so he
+# can't take it.
+# 3. Take the center square over edges and corners.
+# 4. Take corner squares over edges.
+# 5. Take edges if they are the only thing available.
+
+def grid_to_string(arr):
+    grid = ""
+    for i in arr:
+        line = ""
+        for j in i:
+            line += "| "
+            line += j
+            line += " "
+        line += "|\n"
+        grid += line
+    return grid
+
+def ask_gpt(query):
+    global premise, prompt
+    print(query)
+    client = openai.OpenAI()
+    response = client.chat.completions.create(
+        model = "gpt-4-turbo-preview",
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": query}
+        ]
+    )
+    for choice in response.choices:
+        print(choice)
+        cleaned_response = re.sub(r'\\[\[\]\(\)]', '', choice.message.content)
+    for i in cleaned_response:
+        if i.isnumeric():
+            return i
+    return cleaned_response
+
+def update_board(grid, col, piece):
+    col = col - 1
+    for i in range(len(grid)):
+        if grid[i][col] != ".":
+            grid[i - 1][col] = piece
+            break
+    return grid
+
+def simplify_grid(grid, val):
+    new = []
+    for i in grid:
+        line = []
+        for j in range(7):
+            if i[j] == val:
+                line.append(j + 1)
+        new.append(line)
+    return new
+
+def check_horizontal(grid):
+    for i in grid:
+        for j in i:
+            next = j + 1
+            nexter = j + 2
+            nextest = j + 3
+            if next in i and nexter in i and nextest in i:
+                return True
+    return False
+
+def check_vertical(grid):
+    for i in range(len(grid) - 4):
+        for j in range(len(grid[i])):
+            val = grid[i][j]
+            if val in grid[i + 1] and val in grid[i + 2] and val in grid[i + 3]:
+                return True
+    return False
+
+def check_diagonal(grid):
+    for i in range(len(grid) - 4):
+        for j in range(len(grid[i])):
+            val = grid[i][j]
+            next = val + 1
+            nexter = val + 2
+            nextest = val + 3
+            prev = val - 1
+            prever = val - 2
+            prevest = val - 3
+            if next in grid[i + 1] and nexter in grid[i + 2] and nextest in grid[i + 3]:
+                return True
+            elif prev in grid[i + 1] and prever in grid[i + 2] and prevest in grid[i + 3]:
+                return True
+    return False
+
+def check_win(grid):
+    simplified_x = simplify_grid(grid, "X")
+    simplified_y = simplify_grid(grid, "O")
+    win_xhorizontal = check_horizontal(simplified_x)
+    win_yhorizontal = check_horizontal(simplified_y)
+    win_xvertical = check_vertical(simplified_x)
+    win_yvertical = check_vertical(simplified_y)
+    win_xdiagonal = check_diagonal(simplified_x)
+    win_ydiagonal = check_diagonal(simplified_y)
+    if win_xhorizontal or win_xvertical or win_xdiagonal:
+        return True, "X"
+    if win_yhorizontal or win_yvertical or win_ydiagonal:
+        return True, "O"
+    return False, "L"
+
+class connect4(StateMachineProgram):
+    def __init__(self):
+        super().__init__(speech = True,
+                         speech_debug = True)
+
+    class check_first(StateNode):
+        def start(self, event = None):
+            obj = event.result.groups()[0]
+            if obj.lower() == "first":
+                super().start(event)
+                self.post_success()
+            elif obj.lower() == "second":
+                super().start(event)
+                self.post_failure()
+
+    class decide_col(StateNode):
+        def start(self, event = None):
+            global col
+            if col == 4:
+                super().start(event)
+                self.post_success()
+            else:
+                super().start(event)
+                self.post_failure()
+
+    class initial_turn(Turn):
+        def start(self, event = None):
+            global col
+            col = int(col)
+            if int(col) == 4:
+                self.angle = 0
+                super().start(event)
+            elif int(col) < 4:
+                self.angle = 90
+                super().start(event)
+            elif int(col) > 4:
+                self.angle = -90
+                super().start(event)
+    
+    class ccwIfMore(Turn):
+        def start(self, event = None):
+            global col
+            if col < 4:
+                self.angle = -90
+                super().start(event)
+            elif col > 4:
+                self.angle = 90
+                super().start(event)
+
+    class ccwIfLess(Turn):
+        def start(self, event = None):
+            global col
+            if col < 4:
+                self.angle = 90
+                super().start(event)
+            elif col > 4:
+                self.angle = -90
+                super().start(event)
+
+    class gracefulTurnaround(Turn):
+        def start(self, event = None):
+            global col, row
+            if col < 4 and row != 1:
+                self.angle = -180
+                super().start(event)
+            elif col > 4 and row != 1:
+                self.angle = 180
+                super().start(event)
+            elif col==4 and row>=1:
+                self.angle = -180
+                super().start(event)
+            else:
+                self.angle=180
+                super().start(event)
+            
+
+    class move_forward(Forward):
+        def start(self, event = None):
+            global col, distance
+            distance=0
+            if col < 4:
+                cube_x = cube1.pose.position.y
+                robot_x = robot.pose.position.y
+                dist = abs(cube_x - robot_x)
+                travel = (dist / 4) * (4 - col)
+                distance = distance_mm(travel)
+                self.distance = distance
+                super().start(event)
+            elif col > 4:
+                cube_x = cube2.pose.position.y
+                robot_x = robot.pose.position.y
+                dist = abs(cube_x - robot_x)
+                den = 4 - col
+                travel = (dist / 4) * (col - 4)
+                distance = distance_mm(travel)
+                self.distance = distance
+                super().start(event)
+
+    class move_forward2(Forward):
+        def start(self, event = None):
+            global row, distance2, col, query_array
+            distance2=0
+            row = 1
+            for r in range(5,0,-1):
+                if query_array[r][col-1] != "." and query_array[r-1][col-1] == ".":
+                    row = 6-r
+                if r==0:
+                    row = 6
+            cube_x = cube3.pose.position.x
+            robot_x = robot.pose.position.x
+            dist = abs(cube_x - robot_x)
+            travel = (row) * (dist / 6)
+            print("ROWANDTRAVEL", row-1, travel)
+            distance2 = distance_mm(travel)
+            self.distance = distance2
+            super().start(event)
+
+    class move_back(Forward):
+        def start(self, event = None):
+            global distance
+            self.distance = distance
+            super().start(event)
+
+    class move_back2(Forward):
+        def start(self, event = None):
+            global distance2
+            print("BACK dISTNACE: ", distance2)
+            self.distance = distance2
+            super().start(event)
+
+    class cozmo_play(StateNode):
+        def start(self, event = None):
+            global query_array
+            global col
+            query_string = grid_to_string(query_array)
+            col = ask_gpt(query_string)
+            query_array = update_board(query_array, int(col), "X")
+            query_string = grid_to_string(query_array)
+            print(query_string)
+            print(col)
+            super().start(event)
+
+    class user_play(StateNode):
+        def start(self, event = None):
+            global query_array
+            global col
+            col = event.result.groups()[0]
+            if col == "one":
+                col = 1
+            if col == "too" or col == "to" or col == "two":
+                col = 2
+            if col == "three":
+                col = 3
+            if col == "for" or col == "four":
+                col = 4
+            if col == "five":
+                col = 5
+            if col == "six":
+                col = 6
+            if col == "seven":
+                col = 7
+            query_array = update_board(query_array, int(col), "O")
+            query_string = grid_to_string(query_array)
+            print(query_string)
+            super().start(event)
+
+    class check(StateNode):
+        def start(self, event = None):
+            global query_array
+            has_won, winner = check_win(query_array)
+            if has_won:
+                super().start(event)
+                self.post_success()
+            else:
+                super().start(event)
+                self.post_failure()
+
+    class say_here(Say):
+        def start(self, event = None):
+            global col, row
+            self.text = "I play at column " + str(col) + " and row " + str(row)
+            super().start(event)
+
+    class say_winner(Say):
+        def start(self, event = None):
+            global query_array
+            _, winner = check_win(query_array)
+            if winner == "X":
+                self.text = "I win!"
+                super().start(event)
+            elif winner == "O":
+                self.text = "I lose!"
+                super().start(event)
+
+    $setup {
+        start: SetHeadAngle(10)=C=> SetLiftHeight(99) =C=> Forward(200) =C=> Turn(180)=C=> Forward(200) =C=> Turn(-90) =T(2)=> Turn(180) =T(2)=> Turn(90) =C=> Forward(15) =C=> Say("Lets play connect four! Would you like to go first or second?") =Hear("(first|second)")=> cf
+        cf: self.check_first()
+
+        go_first: self.cozmo_play() =N=> self.initial_turn() =C=> gf
+        gf: self.decide_col()
+        gf =S=> self.move_forward2() =C=> self.say_here() =C=> self.gracefulTurnaround() =C=> self.move_back2() =C=> self.gracefulTurnaround() =C=> go_second
+        gf =F=> self.move_forward() =C=> self.ccwIfMore() =C=> self.move_forward2() =C=> self.say_here() =C=> self.gracefulTurnaround() =C=> self.move_back2() =C=> self.ccwIfLess() =C=> self.move_back() =C=> self.ccwIfLess() =C=> go_second
+
+        go_second: self.check()
+        go_second =S=> self.say_winner()
+        go_second =F=> Say("Which column?") =Hear("(one|won|two|too|to|three|for|four|five|six|seven|1|2|3|4|5|6|7)")=> self.user_play() =N=> gs
+
+        gs: self.check()
+        gs =F=> go_first
+        gs =S=> self.say_winner()
+
+        cf =F=> go_first
+        cf =S=> go_second
+    }
